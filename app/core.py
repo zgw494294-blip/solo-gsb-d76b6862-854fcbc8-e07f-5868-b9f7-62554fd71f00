@@ -5,6 +5,7 @@
 - 枚举全部底到顶排列，按未取整 RGB 通道平方误差总和选优
 - 同分时按 ID 序列字典序决胜
 - 图层顺序确定后，可在 0.00～1.00（步长 0.01）网格上联合反推 1～2 个图层的不透明度
+- 下一次背景测量建议：在总误差容差内的候选叠序中，挑选最能把它们区分开的候选背景
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ MAX_RELATIONS = 12
 OPACITY_STEPS = 101  # 0.00～1.00，步长 0.01
 MAX_ADJUST = 2
 MIN_ADJUST = 1
+MIN_CANDIDATE_BGS = 2
+MAX_CANDIDATE_BGS = 12
+MAX_SUGGEST_ORDERS = 12
 
 
 class CalibrationError(Exception):
@@ -361,6 +365,17 @@ def _sample_details(
 # ------------------------------------------------------------------- 求解 --
 
 
+def _feasible_permutations(n: int, pairs: list[tuple[int, int]]) -> list[tuple[int, ...]]:
+    """返回满足先后关系（lower 在 upper 下方）的全部底到顶排列。"""
+    def feasible(perm: tuple[int, ...]) -> bool:
+        pos = [0] * n
+        for p, idx in enumerate(perm):
+            pos[idx] = p
+        return all(pos[li] < pos[ui] for li, ui in pairs)
+
+    return [perm for perm in itertools.permutations(range(n)) if feasible(perm)]
+
+
 def solve(payload: Any) -> dict[str, Any]:
     parsed, errors = _parse_inputs(payload)
     if errors:
@@ -371,22 +386,15 @@ def solve(payload: Any) -> dict[str, Any]:
     pairs = parsed.pairs
 
     # ---- 枚举排列并选优 ---------------------------------------------------
-    def feasible(perm: tuple[int, ...]) -> bool:
-        pos = [0] * n
-        for p, idx in enumerate(perm):
-            pos[idx] = p
-        return all(pos[li] < pos[ui] for li, ui in pairs)
+    feasible_perms = _feasible_permutations(n, pairs)
+    total_count = math.factorial(n)
+    feasible_count = len(feasible_perms)
 
     best_sse = math.inf
     best_key: tuple[float, tuple[str, ...]] | None = None
     best_perm: tuple[int, ...] | None = None
-    feasible_count = 0
-    total_count = math.factorial(n)
 
-    for perm in itertools.permutations(range(n)):
-        if not feasible(perm):
-            continue
-        feasible_count += 1
+    for perm in feasible_perms:
         total_sse = _total_sse(parsed, list(perm), parsed.alphas)
         id_seq = tuple(parsed.ids[idx] for idx in perm)
         if best_key is None or (total_sse, id_seq) < best_key:
@@ -570,3 +578,207 @@ def infer_opacities(payload: Any) -> dict[str, Any]:
         "combosChecked": combos_checked,
         "opacityGrid": {"min": 0.0, "max": 1.0, "step": 0.01},
     }
+
+
+# ------------------------------------------------------- 下一次背景测量建议 --
+
+
+def _rgb_sqdist(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    """未取整 0–255 RGB 三通道平方距离（平方欧氏距离）。"""
+    total = 0.0
+    for c in range(3):
+        d = (a[c] - b[c]) * 255.0
+        total += d * d
+    return total
+
+
+def suggest_background(payload: Any) -> dict[str, Any]:
+    """在容差内的候选叠序中，挑选最能把它们区分开的下一次测量背景。
+
+    - 沿用 solve 的图层 / 样本 / 先后关系解析与线性光渲染
+    - candidateBackgrounds：2～12 个候选背景 HEX，规范化后互不重复
+    - tolerance：非负有限数，单位与 totalSse 相同（未取整 0–255 通道平方误差和）
+    - 保留 totalSse <= 最优 totalSse + tolerance 的顺序，按 (totalSse, ID 序列) 取前 12
+    - 每个候选背景上渲染这些顺序，以任意两顺序预测色的最小平方距离作为背景得分
+    - 推荐得分最高者；同分按规范化 HEX 字典序最小者
+    """
+    parsed, errors = _parse_inputs(payload)
+
+    # ---- 候选背景 ---------------------------------------------------------
+    raw_candidates = payload.get("candidateBackgrounds") if isinstance(payload, dict) else None
+    cand_hexes: list[str] = []
+    cand_srgb: list[tuple[float, float, float]] = []
+    seen_norm: set[str] = set()
+    if not isinstance(raw_candidates, list):
+        errors.append(
+            _err(
+                "candidateBackgrounds",
+                "缺少 candidateBackgrounds 列表或其格式不正确：需要 2～12 个候选背景 HEX",
+            )
+        )
+        raw_candidates = []
+    elif not (MIN_CANDIDATE_BGS <= len(raw_candidates) <= MAX_CANDIDATE_BGS):
+        errors.append(
+            _err(
+                "candidateBackgrounds",
+                f"候选背景必须为 {MIN_CANDIDATE_BGS}～{MAX_CANDIDATE_BGS} 个，当前 {len(raw_candidates)} 个",
+            )
+        )
+
+    for i, raw in enumerate(raw_candidates):
+        try:
+            norm, rgb = parse_hex(raw)
+        except ValueError:
+            errors.append(
+                _err(
+                    "candidateBackgrounds",
+                    f"候选背景色非法：{raw!r}，需要形如 #RRGGBB 的 HEX 值",
+                    i,
+                )
+            )
+            continue
+        if norm in seen_norm:
+            errors.append(
+                _err(
+                    "candidateBackgrounds",
+                    f"候选背景色重复：{norm}（规范化后与前面的候选相同）",
+                    i,
+                )
+            )
+            continue
+        seen_norm.add(norm)
+        cand_hexes.append(norm)
+        cand_srgb.append(rgb)
+
+    # ---- 误差容差 ---------------------------------------------------------
+    raw_tolerance = payload.get("tolerance") if isinstance(payload, dict) else None
+    if isinstance(raw_tolerance, bool) or not isinstance(raw_tolerance, (int, float)):
+        errors.append(
+            _err("tolerance", "缺少 tolerance 或其格式不正确：必须是非负有限数字（总平方误差容差）")
+        )
+        tolerance = 0.0
+    elif not math.isfinite(float(raw_tolerance)):
+        errors.append(_err("tolerance", f"误差容差非法：{raw_tolerance}，必须是非负有限数字"))
+        tolerance = 0.0
+    elif float(raw_tolerance) < 0.0:
+        errors.append(_err("tolerance", f"误差容差不能为负：{raw_tolerance}，必须 ≥ 0"))
+        tolerance = 0.0
+    else:
+        tolerance = float(raw_tolerance)
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+
+    # ---- 枚举合规叠序并按容差筛选 -----------------------------------------
+    n = len(parsed.ids)
+    scored_perms: list[tuple[float, tuple[str, ...], list[int]]] = []
+    best_sse = math.inf
+    for perm in _feasible_permutations(n, parsed.pairs):
+        total_sse = _total_sse(parsed, list(perm), parsed.alphas)
+        if total_sse < best_sse:
+            best_sse = total_sse
+        scored_perms.append((total_sse, tuple(parsed.ids[idx] for idx in perm), list(perm)))
+
+    threshold_raw = best_sse + tolerance
+    threshold_eps = 1e-9 * max(1.0, abs(threshold_raw))
+    # 阈值处加极小相对容差，避免最优顺序因浮点舍入把自己排除
+    within = [item for item in scored_perms if item[0] <= threshold_raw + threshold_eps]
+    within.sort(key=lambda item: (item[0], item[1]))
+    within_total = len(within)
+    kept = within[:MAX_SUGGEST_ORDERS]
+
+    orders_out = [
+        {
+            "rank": k + 1,
+            "order": list(id_seq),
+            "orderIndexes": perm,
+            "totalSse": sse,
+        }
+        for k, (sse, id_seq, perm) in enumerate(kept)
+    ]
+
+    base = {
+        "tolerance": tolerance,
+        "bestTotalSse": best_sse,
+        "threshold": threshold_raw,
+        "feasibleCount": len(scored_perms),
+        "withinToleranceCount": within_total,
+        "ordersShown": len(kept),
+        "ordersLimit": MAX_SUGGEST_ORDERS,
+        "orders": orders_out,
+    }
+
+    # ---- 不足两条顺序：追加测量没有区分对象 -------------------------------
+    if within_total < 2:
+        return {
+            **base,
+            "needExtraMeasurement": False,
+            "message": (
+                f"容差范围内只有 {within_total} 条合规叠序，当前样本已足以确定顺序，"
+                "无需追加下一次背景测量。"
+            ),
+            "candidates": [
+                {"background": hx, "score": None, "hardestPair": None} for hx in cand_hexes
+            ],
+            "recommendedBackground": None,
+            "recommendedScore": None,
+        }
+
+    # ---- 在每个候选背景上渲染保留顺序并两两打分 ---------------------------
+    candidates_out: list[dict[str, Any]] = []
+    for hx, bg_rgb in zip(cand_hexes, cand_srgb):
+        predictions = [
+            render_stack(bg_rgb, perm, parsed.lins, parsed.alphas) for _, _, perm in kept
+        ]
+        best_pair_score = math.inf
+        hardest: dict[str, Any] | None = None
+        m = len(kept)
+        for i in range(m):
+            for j in range(i + 1, m):
+                dist = _rgb_sqdist(predictions[i], predictions[j])
+                # 距离相同时按 (低序号, 高序号) 稳定决胜
+                if hardest is None or dist < best_pair_score:
+                    best_pair_score = dist
+                    hardest = {
+                        "orderRanks": [i + 1, j + 1],
+                        "orderA": list(kept[i][1]),
+                        "orderB": list(kept[j][1]),
+                        "predictedA": list(predictions[i][c] * 255.0 for c in range(3)),
+                        "predictedB": list(predictions[j][c] * 255.0 for c in range(3)),
+                        "predictedAHex": _to_hex255(predictions[i]),
+                        "predictedBHex": _to_hex255(predictions[j]),
+                        "distance": dist,
+                    }
+        assert hardest is not None
+        candidates_out.append(
+            {
+                "background": hx,
+                "score": best_pair_score,
+                "hardestPair": hardest,
+            }
+        )
+
+    # 推荐：得分最高；同分按规范化 HEX 字典序最小
+    winner = min(candidates_out, key=lambda c: (-c["score"], c["background"]))
+
+    return {
+        **base,
+        "needExtraMeasurement": True,
+        "message": (
+            f"容差范围内共有 {within_total} 条合规叠序"
+            + (f"（展示前 {len(kept)} 条）" if within_total > len(kept) else "")
+            + f"，建议追加一次背景为 {winner['background']} 的测量。"
+        ),
+        "candidates": candidates_out,
+        "recommendedBackground": winner["background"],
+        "recommendedScore": winner["score"],
+        "hardestPair": winner["hardestPair"],
+    }
+
+
+def _to_hex255(rgb01: tuple[float, float, float]) -> str:
+    """0~1 sRGB 三元组（可能略越界）取整为 #rrggbb。"""
+    return "#{:02x}{:02x}{:02x}".format(
+        *(max(0, min(255, int(round(_clamp01(rgb01[c]) * 255.0)))) for c in range(3))
+    )

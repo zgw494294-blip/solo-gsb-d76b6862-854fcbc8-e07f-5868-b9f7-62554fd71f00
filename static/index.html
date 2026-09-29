@@ -87,6 +87,35 @@
           <div id="inferResult"></div>
         </div>
       </div>
+
+      <!-- 下一次背景测量建议 -->
+      <div class="card suggest-card" id="suggestCard" hidden>
+        <div class="card-head">
+          <h2>下一次背景测量建议 <span class="hint">（在容差内难分的叠序中挑最易区分的背景）</span></h2>
+          <span id="suggestStatus" class="status"></span>
+        </div>
+        <div id="suggestBody">
+          <div class="suggest-field">
+            <div class="infer-field-label">
+              候选背景 HEX（2～12 个，规范化后互不重复）
+            </div>
+            <div id="suggestCandidates" class="suggest-candidates"></div>
+          </div>
+          <div class="suggest-field">
+            <div class="infer-field-label">误差容差（非负数字，单位为未取整 0–255 通道平方误差总和）</div>
+            <div class="suggest-tolerance-row">
+              <input id="suggestTolerance" type="number" min="0" step="any" value="100" />
+              <span class="spacer"></span>
+              <button id="addCandidateBtn" class="btn btn-ghost btn-small"
+                      data-act="add-candidate" type="button">＋ 添加候选</button>
+              <button id="suggestRunBtn" class="btn btn-small"
+                      data-act="suggest-run" type="button">给出测量建议</button>
+            </div>
+          </div>
+          <div id="suggestErrors" class="infer-errors" hidden></div>
+          <div id="suggestResult"></div>
+        </div>
+      </div>
     </section>
   </main>
 

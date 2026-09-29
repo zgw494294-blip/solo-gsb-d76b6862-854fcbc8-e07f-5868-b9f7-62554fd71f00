@@ -1,6 +1,6 @@
 # 透明图层叠序校准台
 
-本地 Web 应用：录入若干个纯色半透明图层与多组「背景色 / 目标色」样本，自动枚举所有底 → 顶叠放顺序，找出对全部样本整体拟合最好的图层顺序；顺序确定后还可以**从目标色反推 1～2 个图层的建议不透明度**。
+本地 Web 应用：录入若干个纯色半透明图层与多组「背景色 / 目标色」样本，自动枚举所有底 → 顶叠放顺序，找出对全部样本整体拟合最好的图层顺序；顺序确定后还可以**从目标色反推 1～2 个图层的建议不透明度**；当当前样本下存在若干条误差接近、难以区分的叠序时，还能**建议下一次在什么背景色上补测一次**，把这些顺序尽量拉开。
 
 - **后端**：Python + FastAPI（计算核心仅用标准库，便于审阅与测试）
 - **前端**：原生 HTML / CSS / JavaScript，无任何构建步骤与外部 CDN 依赖
@@ -32,6 +32,7 @@ http://localhost:8000
 | 先后关系 | 0～12 条「某图层在更下方 / 另一图层在其上方」约束；形成有向环时明确提示冲突链，例如 `A → B → A` |
 | 结果 | 最终顺序（带半透明色点、底→顶方向）、总平方误差、枚举/可行排列数；每个样本并排显示目标色与预测色、HEX、RGB 与 R/G/B 分通道平方误差 |
 | 不透明度反推 | 顺序确定后，沿用当前图层、样本与先后关系：确认一条底→顶顺序并勾选 1～2 个待调图层，其余图层保留原不透明度。联合遍历待调图层 0.00～1.00、步长 0.01 的全部组合（原始参数组若落在网格外也额外纳入），按同一未取整 RGB 平方误差总和选最优；同分时按 **ID 字典序排列的待调参数元组从小到大** 决胜。页面展示原值 / 建议值、调整前后总误差、每组样本的目标色与调整前后预测色，可一键把建议值写回图层并重新求解 |
+| 下一次背景测量建议 | 录入 2～12 个规范化后互不重复的候选背景 HEX 与一个非负有限的误差容差。枚举合规叠序，保留总误差 ≤ 最优总误差 + 容差的顺序，按总误差、ID 序列排序取前 12 条并显示符合容差的总数；在每个候选背景上按现有线性光规则渲染这些顺序，以**任意两条顺序预测色的未取整 RGB 平方距离最小值**给背景打分，推荐得分最高者（同分按规范化 HEX 字典序最小者），并展示各背景得分及最难区分的一对顺序与预测色；容差内不足两条顺序时说明无需追加测量。输入任意变化后旧建议立即标记为过期 |
 
 输入任意改动后自动重新求解（带防抖），非法颜色、重复 ID、越界不透明度等错误会在页面顶部以中文逐条列出，并暂停计算。
 
@@ -71,7 +72,7 @@ http://localhost:8000
 { "errors": [ { "scope": "layers", "index": 0, "message": "不透明度越界：1.2，必须在 0～1 之间" } ] }
 ```
 
-`scope` 取值为 `layers` / `samples` / `relations` / `form`。
+`scope` 取值为 `layers` / `samples` / `relations` / `form`（反推接口另有 `order` / `adjust`，背景建议接口另有 `candidateBackgrounds` / `tolerance`）。
 
 ### `POST /api/infer-opacity` — 不透明度反推
 
@@ -145,6 +146,93 @@ curl -s -X POST http://localhost:8000/api/infer-opacity \
 ] }
 ```
 
+### `POST /api/suggest-background` — 下一次背景测量建议
+
+沿用 `/api/solve` 的 `layers` / `samples` / `relations`（同样的校验与先后关系），另需：
+
+- `candidateBackgrounds`：**2～12 个**候选背景 HEX，支持 `#RGB` / `#RRGGBB`，服务端规范化后**互不重复**（如 `#abc` 与 `#aabbcc` 视为重复）；
+- `tolerance`：**非负有限数字**，单位与 `totalSse` 相同（全部样本、未取整 0–255 通道平方误差总和）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/suggest-background \
+  -H "Content-Type: application/json" \
+  -d '{
+    "layers": [
+      { "id": "R", "color": "#ff0000", "opacity": 0.5 },
+      { "id": "B", "color": "#0000ff", "opacity": 0.5 }
+    ],
+    "samples": [
+      { "background": "#ffffff", "target": "#e189bc" }
+    ],
+    "relations": [],
+    "candidateBackgrounds": ["#808080", "#ffff00", "#000000"],
+    "tolerance": 3000
+  }'
+```
+
+成功返回（节选）：
+
+```json
+{
+  "tolerance": 3000.0,
+  "bestTotalSse": 0.3876,
+  "threshold": 3000.3876,
+  "feasibleCount": 2,
+  "withinToleranceCount": 2,
+  "ordersShown": 2,
+  "ordersLimit": 12,
+  "needExtraMeasurement": true,
+  "message": "容差范围内共有 2 条合规叠序，建议追加一次背景为 #000000 的测量。",
+  "recommendedBackground": "#000000",
+  "recommendedScore": 5111.789,
+  "orders": [
+    { "rank": 1, "order": ["B", "R"], "orderIndexes": [1, 0], "totalSse": 0.3876 },
+    { "rank": 2, "order": ["R", "B"], "orderIndexes": [0, 1], "totalSse": 2745.3695 }
+  ],
+  "candidates": [
+    {
+      "background": "#808080",
+      "score": 4331.70,
+      "hardestPair": {
+        "orderRanks": [1, 2],
+        "orderA": ["B", "R"], "orderB": ["R", "B"],
+        "predictedAHex": "#c44296", "predictedBHex": "#9642c4",
+        "predictedA": [196.20, 66.06, 150.30],
+        "predictedB": [150.30, 66.06, 196.20],
+        "distance": 4331.70
+      }
+    }
+  ],
+  "hardestPair": {
+    "orderRanks": [1, 2],
+    "orderA": ["B", "R"], "orderB": ["R", "B"],
+    "predictedAHex": "#bc0089", "predictedBHex": "#8900bc",
+    "predictedA": [188.02, 0.0, 137.00],
+    "predictedB": [137.00, 0.0, 188.02],
+    "distance": 5111.789
+  }
+}
+```
+
+说明：
+
+- **筛选**：枚举所有满足先后关系的底→顶顺序，仅保留 `totalSse ≤ bestTotalSse + tolerance` 者；按 `(totalSse, ID 序列字典序)` 排序取前 **12** 条（`orders`），但 `withinToleranceCount` 返回**符合容差的总数**（可能远多于 12）。
+- **打分**：对每个候选背景，用与 `/api/solve` 完全相同的线性光规则渲染保留顺序，两两计算预测色在未取整 0–255 RGB 上的平方欧氏距离，取**最小值**作为该背景得分——得分越高，说明该背景上最接近的一对顺序也分得最开。
+- **推荐**：得分最高的候选背景；同分时选规范化 HEX 字典序最小者。
+- **最难区分的一对**：推荐背景上取得最小距离的那两条顺序（距离相同则按低序号、高序号稳定决胜），一并给出两条顺序的 ID 序列、未取整预测 RGB、取整 HEX 与平方距离；每个候选背景也各自带回自己的 `hardestPair`。
+- **无需测量**：容差内不足两条顺序时，`needExtraMeasurement` 为 `false`，`recommendedBackground` / `recommendedScore` 为 `null`，`message` 说明当前样本已足以确定顺序；候选背景仍列出但 `score` 为 `null`。
+- 典型 400 报错（`scope` 为 `candidateBackgrounds` / `tolerance`，其余校验错误沿用原 scope）：
+
+```json
+{ "errors": [
+  { "scope": "candidateBackgrounds", "message": "候选背景必须为 2～12 个，当前 1 个" },
+  { "scope": "candidateBackgrounds", "index": 1, "message": "候选背景色非法：'zzz'，需要形如 #RRGGBB 的 HEX 值" },
+  { "scope": "candidateBackgrounds", "index": 1, "message": "候选背景色重复：#aabbcc（规范化后与前面的候选相同）" },
+  { "scope": "tolerance", "message": "误差容差不能为负：-2，必须 ≥ 0" },
+  { "scope": "tolerance", "message": "缺少 tolerance 或其格式不正确：必须是非负有限数字（总平方误差容差）" }
+] }
+```
+
 ## 不用 Docker 的本地运行方式（可选）
 
 ```bash
@@ -162,8 +250,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   ├── core.py        # sRGB 转换 / alpha 合成 / 环检测 / 枚举择优 / 不透明度反推（纯标准库）
-│   └── main.py        # FastAPI：/api/solve、/api/infer-opacity 与静态页面托管
+│   ├── core.py        # sRGB 转换 / alpha 合成 / 环检测 / 枚举择优 / 不透明度反推 / 下一次背景建议（纯标准库）
+│   └── main.py        # FastAPI：/api/solve、/api/infer-opacity、/api/suggest-background 与静态页面托管
 ├── static/
 │   ├── index.html
 │   ├── styles.css

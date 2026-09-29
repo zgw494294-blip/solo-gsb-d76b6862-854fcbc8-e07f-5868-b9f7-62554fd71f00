@@ -53,6 +53,7 @@ function scheduleSolve(delay = 200) {
   clearTimeout(solveTimer);
   solveTimer = setTimeout(runSolve, delay);
   markInferStaleness();
+  markSuggestStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -402,6 +403,7 @@ function showErrors(errors) {
   elStatus.className = "status";
   elResultBody.innerHTML = `<div class="result-empty">修正输入后将自动重新计算。</div>`;
   $("#inferCard").hidden = true;
+  $("#suggestCard").hidden = true;
 }
 
 // ------------------------------------------------------------ 结果渲染 --
@@ -544,6 +546,7 @@ function inferSignature() {
 
 function syncInferPanel(solveResult) {
   elInferCard.hidden = false;
+  $("#suggestCard").hidden = false;
   const idSig = state.layers.map((l) => l.id).join("");
   const layerSet = new Set(state.layers.map((l) => l.id));
 
@@ -834,6 +837,343 @@ function applyInferResult() {
   runSolve();
 }
 
+// ============================================================ 下一次背景测量建议 ==
+
+const MIN_CANDIDATES = 2, MAX_CANDIDATES = 12;
+
+const suggestState = {
+  candidates: ["#808080", "#ffff00"], // 候选背景 HEX 原文
+  tolerance: "100",                   // 容差原文（数字框）
+  result: null,
+  resultKey: "",                      // 结果产生时的输入指纹
+};
+
+const elSuggestCandidates = $("#suggestCandidates");
+const elSuggestTolerance = $("#suggestTolerance");
+const elSuggestErrors = $("#suggestErrors");
+const elSuggestResult = $("#suggestResult");
+const elSuggestStatus = $("#suggestStatus");
+
+function suggestSignature() {
+  // 输入（图层 / 样本 / 关系 / 候选 / 容差）指纹；变化后旧建议即失效
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    candidates: suggestState.candidates,
+    tolerance: suggestState.tolerance,
+  });
+}
+
+function candidateNorms() {
+  // 返回每行的规范化结果（非法为 null）与「规范化后重复」集合
+  const norms = suggestState.candidates.map((raw) => normalizeHex(raw));
+  const counts = new Map();
+  norms.forEach((h) => { if (h) counts.set(h, (counts.get(h) || 0) + 1); });
+  const dup = new Set([...counts.entries()].filter(([, n]) => n > 1).map(([h]) => h));
+  return { norms, dup };
+}
+
+function renderSuggestControls() {
+  elSuggestCandidates.innerHTML = "";
+  suggestState.candidates.forEach((raw, i) => {
+    const row = document.createElement("div");
+    row.className = "candidate-row";
+    row.innerHTML = `
+      <span class="row-index">${i + 1}</span>
+      <input type="color" data-act="candidate-picker" data-i="${i}"
+             value="${normalizeHex(raw) || "#000000"}" title="选色" />
+      <input class="hex-input" data-act="candidate-hex"
+             data-i="${i}" type="text" value="${escapeHtml(raw)}" placeholder="#RRGGBB" />
+      <span class="spacer"></span>
+      <button class="btn btn-ghost btn-small" data-act="remove-candidate" data-i="${i}"
+              type="button">删除</button>
+    `;
+    elSuggestCandidates.appendChild(row);
+  });
+  refreshCandidateValidity();
+}
+
+// 不重建行，仅刷新非法/重复标记与增删按钮可用性（避免输入时丢焦点）
+function refreshCandidateValidity() {
+  const { norms, dup } = candidateNorms();
+  elSuggestCandidates.querySelectorAll(".candidate-row").forEach((row, i) => {
+    const invalid = norms[i] === null || dup.has(norms[i]);
+    row.querySelector('[data-act="candidate-hex"]').classList.toggle("invalid", invalid);
+  });
+  $("#addCandidateBtn").disabled = suggestState.candidates.length >= MAX_CANDIDATES;
+  const atMin = suggestState.candidates.length <= MIN_CANDIDATES;
+  elSuggestCandidates.querySelectorAll('[data-act="remove-candidate"]').forEach((btn) => {
+    btn.disabled = atMin;
+  });
+
+  const tNum = parseFloat(suggestState.tolerance);
+  const tolValid = Number.isFinite(tNum) && tNum >= 0;
+  elSuggestTolerance.classList.toggle("invalid", !tolValid);
+}
+
+function markSuggestStaleness() {
+  if (!suggestState.result) return;
+  const fresh = suggestSignature() === suggestState.resultKey;
+  const old = elSuggestResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "输入或候选已变化，以下建议基于旧输入，请重新生成。";
+    elSuggestResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+}
+
+function suggestResultFresh() {
+  return !!suggestState.result && suggestSignature() === suggestState.resultKey;
+}
+
+// 候选项的增删与输入（与图层区同样的事件代理）
+document.addEventListener("input", (e) => {
+  const t = e.target;
+  const act = t.dataset.act;
+  if (act === "candidate-hex") {
+    const i = Number(t.dataset.i);
+    suggestState.candidates[i] = t.value;
+    const norm = normalizeHex(t.value);
+    const picker = elSuggestCandidates.querySelector(`[data-act="candidate-picker"][data-i="${i}"]`);
+    if (picker && norm) picker.value = norm;
+    refreshCandidateValidity();
+    markSuggestStaleness();
+  } else if (act === "candidate-picker") {
+    const i = Number(t.dataset.i);
+    suggestState.candidates[i] = t.value.toLowerCase();
+    const textEl = elSuggestCandidates.querySelector(`[data-act="candidate-hex"][data-i="${i}"]`);
+    if (textEl && textEl.value !== t.value.toLowerCase()) {
+      textEl.value = t.value.toLowerCase();
+    }
+    refreshCandidateValidity();
+    markSuggestStaleness();
+  }
+});
+
+elSuggestTolerance.addEventListener("input", () => {
+  suggestState.tolerance = elSuggestTolerance.value;
+  const tNum = parseFloat(suggestState.tolerance);
+  const tolValid = Number.isFinite(tNum) && tNum >= 0;
+  elSuggestTolerance.classList.toggle("invalid", !tolValid);
+  markSuggestStaleness();
+});
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const act = btn.dataset.act;
+  if (act === "add-candidate" && suggestState.candidates.length < MAX_CANDIDATES) {
+    suggestState.candidates.push("#ffffff");
+    renderSuggestControls();
+    markSuggestStaleness();
+  } else if (act === "remove-candidate" && suggestState.candidates.length > MIN_CANDIDATES) {
+    suggestState.candidates.splice(Number(btn.dataset.i), 1);
+    renderSuggestControls();
+    markSuggestStaleness();
+  } else if (act === "suggest-run") {
+    runSuggest();
+  }
+});
+
+function validateSuggestInputs() {
+  const errs = [];
+  const raws = suggestState.candidates;
+  if (!(MIN_CANDIDATES <= raws.length && raws.length <= MAX_CANDIDATES)) {
+    errs.push(`候选背景必须为 ${MIN_CANDIDATES}～${MAX_CANDIDATES} 个，当前 ${raws.length} 个`);
+  }
+  const seen = new Set();
+  raws.forEach((raw, i) => {
+    const norm = normalizeHex(raw);
+    if (norm === null) {
+      errs.push(`第 ${i + 1} 个候选背景色非法：${String(raw).trim() || "（空）"}，需要形如 #RRGGBB 的 HEX 值`);
+    } else if (seen.has(norm)) {
+      errs.push(`第 ${i + 1} 个候选背景色重复：${norm}（规范化后与前面的候选相同）`);
+    } else {
+      seen.add(norm);
+    }
+  });
+  const tNum = parseFloat(suggestState.tolerance);
+  if (!Number.isFinite(tNum) || tNum < 0) {
+    errs.push("误差容差必须是非负有限数字");
+  }
+  return errs;
+}
+
+async function runSuggest() {
+  const errs = validateSuggestInputs();
+  if (errs.length) {
+    showSuggestErrors(errs);
+    return;
+  }
+  elSuggestErrors.hidden = true;
+  elSuggestStatus.textContent = "评估中…";
+  elSuggestStatus.className = "status busy";
+
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    candidateBackgrounds: suggestState.candidates.map((c) => normalizeHex(c) || c),
+    tolerance: parseFloat(suggestState.tolerance),
+  };
+
+  try {
+    const resp = await fetch("/api/suggest-background", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elSuggestStatus.textContent = "";
+    elSuggestStatus.className = "status";
+    if (!resp.ok) {
+      showSuggestErrors((data.errors || [{ message: "生成建议失败" }]).map((er) => er.message));
+      return;
+    }
+    suggestState.result = data;
+    suggestState.resultKey = suggestSignature();
+    renderSuggestResult(data);
+  } catch (err) {
+    elSuggestStatus.textContent = "";
+    elSuggestStatus.className = "status";
+    showSuggestErrors(["无法连接计算服务：" + err.message]);
+  }
+}
+
+function showSuggestErrors(messages) {
+  elSuggestErrors.innerHTML = "<ul>" + messages.map((m) => `<li>${escapeHtml(m)}</li>`).join("") + "</ul>";
+  elSuggestErrors.hidden = false;
+}
+
+function renderSuggestResult(r) {
+  elSuggestErrors.hidden = true;
+  const stale = suggestResultFresh()
+    ? ""
+    : '<div class="stale-note">输入或候选已变化，以下建议基于旧输入，请重新生成。</div>';
+
+  const truncNote = r.withinToleranceCount > r.ordersShown
+    ? `（按总误差、ID 序列取前 ${r.ordersShown} 条）`
+    : "";
+  const summary = `
+    <div class="suggest-summary">
+      <span>最优总误差：<b>${fmtSse(r.bestTotalSse)}</b></span>
+      <span>容差：<b>${fmtSse(r.tolerance)}</b></span>
+      <span>阈值：<b>${fmtSse(r.threshold)}</b></span>
+      <span>符合容差的顺序：<b>${r.withinToleranceCount}</b> / ${r.feasibleCount} 条 ${truncNote}</span>
+    </div>`;
+
+  const ordersTable = renderOrdersTable(r.orders);
+
+  let body;
+  if (!r.needExtraMeasurement) {
+    body = `
+      ${stale}
+      ${summary}
+      <div class="suggest-none">
+        容差范围内只有 ${r.withinToleranceCount} 条合规叠序，当前样本已足以确定顺序，<b>无需追加测量</b>。
+      </div>
+      <div class="infer-field-label">候选背景（未打分，得分仅在存在两条以上待区分顺序时才有意义）</div>
+      ${renderCandidateTable(r.candidates, null)}`;
+  } else {
+    body = `
+      ${stale}
+      ${summary}
+      <div class="suggest-reco">
+        建议下一次在背景
+        <span class="reco-swatch" style="background:${r.recommendedBackground}"></span>
+        <b class="mono">${r.recommendedBackground}</b>
+        上测量（得分 <b class="mono">${fmtSse(r.recommendedScore)}</b>，
+        为该背景上任意两顺序预测色的最小未取整 RGB 平方距离，越大越易区分；同分按 HEX 字典序）。
+      </div>
+      ${renderHardestPair(r.hardestPair)}
+      <div class="infer-field-label">各候选背景得分（任意两条顺序预测色的最小未取整 RGB 平方距离，越大越好）</div>
+      ${renderCandidateTable(r.candidates, r.recommendedBackground)}
+      ${ordersTable}`;
+  }
+  elSuggestResult.innerHTML = body;
+}
+
+function renderHardestPair(hp) {
+  return `
+    <div class="hardest-pair">
+      <div class="hardest-title">推荐背景上最难区分的一对顺序（第 ${hp.orderRanks[0]} / ${hp.orderRanks[1]} 条，平方距离 ${fmtSse(hp.distance)}）</div>
+      <div class="tri-compare">
+        ${hardestCell("顺序 " + hp.orderRanks[0] + "：" + hp.orderA.join(" → "),
+                      hp.predictedAHex, hp.predictedA)}
+        <span class="tri-arrow">vs</span>
+        ${hardestCell("顺序 " + hp.orderRanks[1] + "：" + hp.orderB.join(" → "),
+                      hp.predictedBHex, hp.predictedB)}
+      </div>
+    </div>`;
+}
+
+function hardestCell(tag, hex, rgb255) {
+  const rgbTxt = rgb255.map((v) => v.toFixed(2)).join(", ");
+  const rgbRound = rgb255.map((v) => Math.round(v)).join(", ");
+  return `
+    <div class="tri-cell">
+      <div class="cell-tag"><span>${escapeHtml(tag)}</span></div>
+      <div class="tri-swatch">
+        <span class="swatch-big" style="background:${hex}"></span>
+        <span>
+          <div class="hexval">${hex}</div>
+          <div class="name">rgb(${rgbTxt}) 未取整</div>
+          <div class="name">rgb(${rgbRound})</div>
+        </span>
+      </div>
+    </div>`;
+}
+
+function renderCandidateTable(candidates, recommended) {
+  // 展示顺序：得分由高到低，同分按 HEX 字典序；无需测量时 score 为 null，按 HEX 排
+  const rows = candidates
+    .slice()
+    .sort((x, y) => (x.score == null || y.score == null
+      ? x.background.localeCompare(y.background)
+      : y.score - x.score || x.background.localeCompare(y.background)))
+    .map((c) => {
+      const hp = c.hardestPair;
+      const isRec = c.background === recommended;
+      const scoreTxt = c.score == null ? "—" : fmtSse(c.score);
+      const pairTxt = hp ? `第 ${hp.orderRanks[0]} / ${hp.orderRanks[1]} 条（距离 ${fmtSse(hp.distance)}）` : "—";
+      return `
+        <tr class="${isRec ? "candidate-reco" : ""}">
+          <td><span class="cand-swatch" style="background:${c.background}"></span></td>
+          <td class="mono">${c.background}${isRec ? ' <span class="reco-tag">推荐</span>' : ""}</td>
+          <td class="num mono">${scoreTxt}</td>
+          <td class="hint">${pairTxt}</td>
+        </tr>`;
+    })
+    .join("");
+  return `
+    <table class="adj-table candidate-table">
+      <thead><tr><th></th><th>候选背景</th><th>得分</th><th>最难区分的一对</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderOrdersTable(orders) {
+  const rows = orders
+    .map((o) => `
+      <tr>
+        <td class="num">${o.rank}</td>
+        <td class="mono">${o.order.map(escapeHtml).join(" → ")}</td>
+        <td class="num mono">${fmtSse(o.totalSse)}</td>
+      </tr>`)
+    .join("");
+  return `
+    <div class="orders-table-title">参与区分的候选叠序（按总误差、ID 序列排序）</div>
+    <table class="adj-table orders-table">
+      <thead><tr><th>#</th><th>底 → 顶 ID 序列</th><th>总平方误差</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 // ------------------------------------------------------------ 启动 --
 render();
+renderSuggestControls();
 runSolve();
