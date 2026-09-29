@@ -5,6 +5,8 @@
 - 枚举全部底到顶排列，按未取整 RGB 通道平方误差总和选优
 - 同分时按 ID 序列字典序决胜
 - 图层顺序确定后，可在 0.00～1.00（步长 0.01）网格上联合反推 1～2 个图层的不透明度
+- 下一次背景测量建议：保留总误差不高于最优总误差 + 容差的叠序，
+  在候选背景上渲染后以「任意两条预测色未取整 RGB 平方距离最小值」打分并推荐
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ MAX_RELATIONS = 12
 OPACITY_STEPS = 101  # 0.00～1.00，步长 0.01
 MAX_ADJUST = 2
 MIN_ADJUST = 1
+MIN_CANDIDATES = 2
+MAX_CANDIDATES = 12
+MAX_SUGGEST_ORDERS = 12
 
 
 class CalibrationError(Exception):
@@ -570,3 +575,166 @@ def infer_opacities(payload: Any) -> dict[str, Any]:
         "combosChecked": combos_checked,
         "opacityGrid": {"min": 0.0, "max": 1.0, "step": 0.01},
     }
+
+
+# --------------------------------------------------------- 背景测量建议 --
+
+
+def suggest_background(payload: Any) -> dict[str, Any]:
+    """下一次背景测量建议。
+
+    沿用当前图层、样本与先后关系：枚举合规叠序，保留总误差不高于
+    最优总误差 + 容差的顺序（按总误差、ID 序列排序取前 12 条），再在每个
+    候选背景上按现有线性光规则渲染这些顺序，以任意两条预测色未取整
+    RGB（0–255 尺度）平方距离的最小值给背景打分；推荐得分最高者，
+    同分取规范化 HEX 字典序最小者。容差内不足两条顺序时无需追加测量。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    # ---- 候选背景 ---------------------------------------------------------
+    raw_candidates = payload.get("candidateBackgrounds")
+    if not isinstance(raw_candidates, list):
+        errors.append(_err("candidates", "缺少 candidateBackgrounds 列表或其格式不正确"))
+        raw_candidates = []
+    if not (MIN_CANDIDATES <= len(raw_candidates) <= MAX_CANDIDATES):
+        errors.append(
+            _err(
+                "candidates",
+                f"候选背景数量必须在 {MIN_CANDIDATES}～{MAX_CANDIDATES} 个之间，当前 {len(raw_candidates)} 个",
+            )
+        )
+
+    cand_hex: list[str] = []
+    cand_srgb: list[tuple[float, float, float]] = []
+    seen_cand: dict[str, int] = {}
+    for i, item in enumerate(raw_candidates[:MAX_CANDIDATES]):
+        try:
+            norm, rgb = parse_hex(item)
+        except ValueError:
+            errors.append(
+                _err("candidates", f"候选背景色非法：需要形如 #RRGGBB 的 HEX 值，实际为 {item!r}", i)
+            )
+            continue
+        if norm in seen_cand:
+            errors.append(
+                _err("candidates", f"候选背景色重复：{norm}（与第 {seen_cand[norm] + 1} 个规范化后相同）", i)
+            )
+            continue
+        seen_cand[norm] = i
+        cand_hex.append(norm)
+        cand_srgb.append(rgb)
+
+    # ---- 误差容差 ----------------------------------------------------------
+    raw_tol = payload.get("tolerance")
+    tolerance = 0.0
+    if isinstance(raw_tol, bool) or not isinstance(raw_tol, (int, float)) or not math.isfinite(raw_tol):
+        errors.append(_err("tolerance", f"误差容差必须是非负有限的数字，实际为 {raw_tol!r}"))
+    elif raw_tol < 0:
+        errors.append(_err("tolerance", f"误差容差不能为负：{raw_tol}"))
+    else:
+        tolerance = float(raw_tol)
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+
+    n = len(parsed.ids)
+    pairs = parsed.pairs
+
+    def feasible(perm: tuple[int, ...]) -> bool:
+        pos = [0] * n
+        for p, idx in enumerate(perm):
+            pos[idx] = p
+        return all(pos[li] < pos[ui] for li, ui in pairs)
+
+    # ---- 枚举合规叠序，按容差保留 ------------------------------------------
+    evaluated: list[tuple[float, tuple[str, ...], tuple[int, ...]]] = []
+    best_sse = math.inf
+    for perm in itertools.permutations(range(n)):
+        if not feasible(perm):
+            continue
+        sse = _total_sse(parsed, list(perm), parsed.alphas)
+        best_sse = min(best_sse, sse)
+        evaluated.append((sse, tuple(parsed.ids[idx] for idx in perm), perm))
+
+    feasible_count = len(evaluated)
+    limit = best_sse + tolerance
+    kept = [e for e in evaluated if e[0] <= limit]
+    kept.sort(key=lambda e: (e[0], e[1]))
+    within_count = len(kept)
+    top = kept[:MAX_SUGGEST_ORDERS]
+
+    # 展示用总误差走 _sample_details 汇总，与 /api/solve 的 totalSse 逐位一致
+    orders: list[dict[str, Any]] = []
+    for _sse, id_seq, perm in top:
+        _, display_sse = _sample_details(parsed, list(perm), parsed.alphas)
+        orders.append(
+            {
+                "order": list(id_seq),
+                "orderIndexes": list(perm),
+                "totalSse": display_sse,
+            }
+        )
+
+    result: dict[str, Any] = {
+        "tolerance": tolerance,
+        "bestSse": orders[0]["totalSse"] if orders else best_sse,
+        "feasibleCount": feasible_count,
+        "withinCount": within_count,
+        "orders": orders,
+        "needsMeasurement": len(orders) >= 2,
+        "candidates": [],
+        "recommended": None,
+    }
+
+    if len(orders) < 2:
+        return result  # 容差内不足两条顺序：当前样本已能唯一区分，无需追加测量
+
+    # ---- 在每个候选背景上渲染并打分 ----------------------------------------
+    order_perms = [list(perm) for _sse, _ids, perm in top]
+
+    def pred_entry(k: int, preds255: list[tuple[float, float, float]]) -> dict[str, Any]:
+        p = preds255[k]
+        rounded = [max(0, min(255, int(round(v)))) for v in p]
+        return {
+            "order": orders[k]["order"],
+            "orderIndexes": orders[k]["orderIndexes"],
+            "predictedRgb": [p[0], p[1], p[2]],
+            "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
+        }
+
+    recommended: dict[str, Any] | None = None
+    for hex_norm, bg_srgb in zip(cand_hex, cand_srgb):
+        preds255: list[tuple[float, float, float]] = []
+        for perm in order_perms:
+            pred = render_stack(bg_srgb, perm, parsed.lins, parsed.alphas)
+            preds255.append((pred[0] * 255.0, pred[1] * 255.0, pred[2] * 255.0))
+
+        # 任意两条顺序预测色的平方距离最小值即该背景得分；同分保留先枚举到的一对
+        min_dist = math.inf
+        min_pair = (0, 1)
+        for i in range(len(preds255)):
+            ai = preds255[i]
+            for j in range(i + 1, len(preds255)):
+                aj = preds255[j]
+                d = (ai[0] - aj[0]) ** 2 + (ai[1] - aj[1]) ** 2 + (ai[2] - aj[2]) ** 2
+                if d < min_dist:
+                    min_dist = d
+                    min_pair = (i, j)
+
+        entry = {
+            "hex": hex_norm,
+            "score": min_dist,
+            "pair": {"a": pred_entry(min_pair[0], preds255), "b": pred_entry(min_pair[1], preds255)},
+        }
+        result["candidates"].append(entry)
+        if (
+            recommended is None
+            or entry["score"] > recommended["score"]
+            or (entry["score"] == recommended["score"] and entry["hex"] < recommended["hex"])
+        ):
+            recommended = entry
+
+    result["recommended"] = recommended
+    return result

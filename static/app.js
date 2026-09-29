@@ -4,6 +4,7 @@
 const MIN_LAYERS = 2, MAX_LAYERS = 7;
 const MIN_SAMPLES = 1, MAX_SAMPLES = 4;
 const MAX_RELATIONS = 12;
+const MIN_CANDIDATES = 2, MAX_CANDIDATES = 12;
 
 const state = {
   layers: [
@@ -53,6 +54,7 @@ function scheduleSolve(delay = 200) {
   clearTimeout(solveTimer);
   solveTimer = setTimeout(runSolve, delay);
   markInferStaleness();
+  markSuggestStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -249,6 +251,24 @@ document.addEventListener("input", (e) => {
       state.relations[i].upper = t.value;
       scheduleSolve();
       break;
+    case "suggest-hex":
+      suggestState.candidates[i] = t.value;
+      syncPicker(t, "suggest-picker", i, t.value);
+      refreshSuggestCandValidity();
+      markSuggestStaleness();
+      break;
+    case "suggest-picker":
+      suggestState.candidates[i] = t.value.toLowerCase();
+      syncTextInput("suggest-hex", i, t.value.toLowerCase());
+      refreshSuggestCandValidity();
+      markSuggestStaleness();
+      break;
+    case "suggest-tolerance": {
+      const v = parseFloat(t.value);
+      suggestState.tolerance = Number.isNaN(v) ? t.value : v;
+      markSuggestStaleness();
+      break;
+    }
   }
 });
 
@@ -324,6 +344,14 @@ document.addEventListener("click", (e) => {
     state.relations.splice(i, 1);
     render();
     scheduleSolve(0);
+  } else if (act === "suggest-add" && suggestState.candidates.length < MAX_CANDIDATES) {
+    suggestState.candidates.push("#808080");
+    renderSuggestControls();
+    markSuggestStaleness();
+  } else if (act === "suggest-remove" && suggestState.candidates.length > MIN_CANDIDATES) {
+    suggestState.candidates.splice(i, 1);
+    renderSuggestControls();
+    markSuggestStaleness();
   }
 });
 
@@ -443,6 +471,7 @@ function renderResult(r) {
     ${r.samples.map(renderSample).join("")}
   `;
   elResultBody.innerHTML = body;
+  $("#suggestCard").hidden = false;
   syncInferPanel(r);
 }
 
@@ -691,6 +720,7 @@ document.addEventListener("click", (e) => {
   if (!btn) return;
   if (btn.dataset.act === "infer-run") runInfer();
   if (btn.dataset.act === "infer-apply") applyInferResult();
+  if (btn.dataset.act === "suggest-run") runSuggest();
 });
 
 async function runInfer() {
@@ -834,6 +864,202 @@ function applyInferResult() {
   runSolve();
 }
 
+// ====================================================== 下一次背景测量建议 ==
+
+const suggestState = {
+  candidates: ["#ffffff", "#000000"], // 候选背景 HEX（按录入原样保存，提交时由后端规范化校验）
+  tolerance: 0,                       // 误差容差（非负有限数字；非法输入保留原样交后端报错）
+  result: null,                       // 最近一次成功返回
+  resultKey: "",                      // 结果产生时的输入指纹
+};
+
+const elSuggestResult = $("#suggestResult");
+const elSuggestErrors = $("#suggestErrors");
+const elSuggestStatus = $("#suggestStatus");
+
+function suggestSignature() {
+  // 用于判断已有建议是否对应当前输入
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    candidates: suggestState.candidates,
+    tolerance: suggestState.tolerance,
+  });
+}
+
+function renderSuggestControls() {
+  const box = $("#suggestCands");
+  box.innerHTML = "";
+  suggestState.candidates.forEach((cand, i) => {
+    const hx = normalizeHex(cand);
+    const row = document.createElement("div");
+    row.className = "sample-row";
+    row.innerHTML = `
+      <span class="row-index">${i + 1}</span>
+      <input type="color" data-act="suggest-picker" data-i="${i}"
+             value="${hx || "#000000"}" title="选色" />
+      <input class="hex-input" data-act="suggest-hex" data-i="${i}" type="text"
+             value="${escapeHtml(cand)}" placeholder="#RRGGBB" />
+      <span class="spacer"></span>
+      <button class="btn btn-ghost btn-small" data-act="suggest-remove" data-i="${i}"
+              type="button" ${suggestState.candidates.length <= MIN_CANDIDATES ? "disabled" : ""}>删除</button>
+    `;
+    box.appendChild(row);
+  });
+  $("#addSuggestCandBtn").disabled = suggestState.candidates.length >= MAX_CANDIDATES;
+  refreshSuggestCandValidity();
+}
+
+// 不重绘行、就地切换非法/重复标记，避免打断输入焦点
+function refreshSuggestCandValidity() {
+  const inputs = [...document.querySelectorAll('input[data-act="suggest-hex"]')];
+  const norms = inputs.map((el) => normalizeHex(el.value));
+  const counts = {};
+  norms.forEach((hx) => {
+    if (hx) counts[hx] = (counts[hx] || 0) + 1;
+  });
+  inputs.forEach((el, k) => {
+    const hx = norms[k];
+    el.classList.toggle("invalid", !hx || counts[hx] > 1);
+    el.title = hx && counts[hx] > 1 ? "候选背景规范化后重复" : "";
+  });
+}
+
+function markSuggestStaleness() {
+  if (!suggestState.result) return;
+  const fresh = suggestSignature() === suggestState.resultKey;
+  const old = elSuggestResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "输入已变化，以下建议可能过期，请重新计算。";
+    elSuggestResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+}
+
+async function runSuggest() {
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    candidateBackgrounds: [...suggestState.candidates],
+    tolerance: suggestState.tolerance,
+  };
+  elSuggestStatus.textContent = "计算中…";
+  elSuggestStatus.className = "status busy";
+  elSuggestErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/suggest-background", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elSuggestStatus.textContent = "";
+    elSuggestStatus.className = "status";
+    if (!resp.ok) {
+      showSuggestErrors(data.errors || [{ scope: "form", message: "建议计算失败" }]);
+      return;
+    }
+    suggestState.result = data;
+    suggestState.resultKey = suggestSignature();
+    renderSuggestResult(data);
+  } catch (err) {
+    elSuggestStatus.textContent = "";
+    elSuggestStatus.className = "status";
+    showSuggestErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showSuggestErrors(errors) {
+  elSuggestErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elSuggestErrors.hidden = false;
+}
+
+function renderSuggestResult(r) {
+  const orderRows = r.orders
+    .map(
+      (o, k) => `
+        <div class="suggest-order-row">
+          <span class="row-index">${k + 1}</span>
+          <span class="suggest-order-ids">${o.order.map(escapeHtml).join(" ↑ ")}</span>
+          <span class="hint">总误差 ${fmtSse(o.totalSse)}</span>
+        </div>`
+    )
+    .join("");
+
+  let html = `
+    <div class="metric-row">
+      <span>最优总误差：<b>${fmtSse(r.bestSse)}</b></span>
+      <span>容差：<b>${fmtSse(r.tolerance)}</b></span>
+      <span>符合容差的叠序总数：<b>${r.withinCount}</b>（可行共 ${r.feasibleCount} 条）</span>
+      <span>按总误差、ID 序列排序，展示前 <b>${r.orders.length}</b> 条</span>
+    </div>
+    <div class="suggest-orders">${orderRows}</div>
+  `;
+
+  if (!r.needsMeasurement) {
+    html += `
+      <div class="suggest-none">容差内不足两条叠序，当前样本已能唯一区分叠放顺序，无需追加背景测量。</div>`;
+    elSuggestResult.innerHTML = html;
+    return;
+  }
+
+  const rec = r.recommended;
+  const candRows = r.candidates
+    .map((c) => {
+      const isRec = rec && c.hex === rec.hex;
+      return `
+        <div class="suggest-cand-row ${isRec ? "rec" : ""}">
+          <span class="mini" style="background:${c.hex}"></span>
+          <span class="hexval">${c.hex}</span>
+          <span class="suggest-score">最小平方距离得分 <b>${fmtSse(c.score)}</b></span>
+          ${isRec ? '<span class="rec-badge">推荐</span>' : ""}
+        </div>`;
+    })
+    .join("");
+
+  html += `
+    <div class="suggest-sec-title">各候选背景得分（任意两条预测色未取整 RGB 平方距离的最小值，越大越易区分）</div>
+    <div class="suggest-cand-list">${candRows}</div>
+    <div class="suggest-sec-title">
+      推荐下一次测量背景
+      <span class="mini" style="background:${rec.hex}"></span>
+      <b class="hexval">${rec.hex}</b>
+      ，其最难区分的一对叠序：
+    </div>
+    <div class="compare suggest-pair">
+      ${suggestPairCell(rec.pair.a)}
+      <div class="compare-arrow">⇄</div>
+      ${suggestPairCell(rec.pair.b)}
+    </div>
+    <div class="hint suggest-pair-note">
+      两者在 ${rec.hex} 上的未取整 RGB 平方距离为 ${fmtSse(rec.score)}；
+      在该背景下补测一次，可最大程度拉开这对顺序的预测色差距。
+    </div>
+  `;
+  elSuggestResult.innerHTML = html;
+}
+
+function suggestPairCell(side) {
+  const rgbTxt = side.predictedRgb.map((v) => Math.round(v)).join(", ");
+  return `
+    <div class="swatch-box">
+      <span class="swatch-big" style="background:${side.predictedHex}"></span>
+      <span class="swatch-meta">
+        <div class="name">${side.order.map(escapeHtml).join(" ↑ ")}</div>
+        <div class="hexval">${side.predictedHex}</div>
+        <div class="name">rgb(${rgbTxt})</div>
+      </span>
+    </div>`;
+}
+
 // ------------------------------------------------------------ 启动 --
 render();
+renderSuggestControls();
 runSolve();

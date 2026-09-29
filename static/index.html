@@ -64,6 +64,36 @@
         </div>
       </div>
 
+      <!-- 下一次背景测量建议 -->
+      <div class="card suggest-card" id="suggestCard" hidden>
+        <div class="card-head">
+          <h2>下一次背景测量建议 <span class="hint">（区分当前样本下难分的叠序）</span></h2>
+          <span id="suggestStatus" class="status"></span>
+        </div>
+        <div id="suggestBody">
+          <div class="infer-field">
+            <div class="infer-field-label">候选背景（2～12 个，规范化后互不重复）</div>
+            <div id="suggestCands" class="rows"></div>
+            <div class="suggest-cand-actions">
+              <button id="addSuggestCandBtn" class="btn btn-ghost btn-small" data-act="suggest-add"
+                      type="button">＋ 添加候选背景</button>
+            </div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">误差容差（非负有限；保留总误差 ≤ 最优总误差 ＋ 容差的叠序）</div>
+            <input id="suggestTolerance" data-act="suggest-tolerance" type="number"
+                   min="0" step="any" value="0" />
+          </div>
+          <div class="infer-actions">
+            <button id="suggestRunBtn" class="btn btn-small" data-act="suggest-run"
+                    type="button">计算背景测量建议</button>
+            <span id="suggestHint" class="hint">沿用当前图层、样本与先后关系</span>
+          </div>
+          <div id="suggestErrors" class="infer-errors" hidden></div>
+          <div id="suggestResult"></div>
+        </div>
+      </div>
+
       <!-- 不透明度反推 -->
       <div class="card infer-card" id="inferCard" hidden>
         <div class="card-head">
